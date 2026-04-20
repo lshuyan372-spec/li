@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Project Nova - 终极星河烟花引擎</title>
+    <style>
+        body, html { margin: 0; padding: 0; background-color: #020205; overflow: hidden; font-family: 'PingFang SC', sans-serif; color: white; }
+        /* 摄像头背景，降低饱和度和透明度以突出粒子辉光 */
+        #video-bg {
+            position: absolute; top: 0; left: 0; width: 100vw; height: 100vh;
+            object-fit: cover; z-index: -1; transform: scaleX(-1); opacity: 0.2; filter: grayscale(80%);
+        }
+        #canvas-container { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 1; }
+        
+        .ui-panel {
+            position: absolute; bottom: 40px; left: 50%; transform: translateX(-50%); z-index: 10;
+            background: rgba(10, 10, 15, 0.7); backdrop-filter: blur(12px);
+            padding: 15px 30px; border-radius: 30px; border: 1px solid rgba(255,255,255,0.15);
+            text-align: center; pointer-events: none; box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            transition: all 0.3s ease;
+        }
+        #stage-text { font-size: 18px; font-weight: bold; letter-spacing: 3px; color: #fff; text-shadow: 0 0 10px rgba(255,255,255,0.5); }
+        .hint { font-size: 12px; color: #aaa; margin-top: 8px; font-weight: 300; }
+        
+        /* 辉光闪烁动画 */
+        @keyframes pulse { 0% { opacity: 0.8; } 50% { opacity: 1; text-shadow: 0 0 20px #ff66b2; } 100% { opacity: 0.8; } }
+        .glowing { animation: pulse 1.5s infinite; color: #ff66b2 !important; }
+    </style>
+    
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+</head>
+<body>
+<video id="video-bg" autoplay playsinline></video>
+<div id="canvas-container"></div>
+<div class="ui-panel">
+    <div id="stage-text">✨ 浩瀚银河 缓缓流转</div>
+    <div class="hint" id="hint-text">🖐️ 右手捏合：捕获星光礼物 | 🖱️ 点击屏幕：直接推进</div>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+// ==========================================
+// 核心状态机与参数
+// ==========================================
+const P_COUNT = 25000; // 粒子总数
+const STATES = { GALAXY: 0, GIFT: 1, TEXT: 2, FIREWORK: 3 };
+let currentState = STATES.GALAXY;
+let scene, camera, renderer, composer, bloomPass, particles;
+let posArray, velArray, targetArray, colorArray;
+let galaxyPoints = [], giftPoints = [], textPoints = [];
+// 色彩美学定义
+const c_Silver = new THREE.Color(0xcccccc);
+const c_CoreWhite = new THREE.Color(0xffffff);
+const c_Gold = new THREE.Color(0xffaa00);
+const c_Pink = new THREE.Color(0xff2a7a);
+// 交互与时间管理
+let rightHand = { active: false, pos: new THREE.Vector3(), pinch: false, open: 1 };
+const clock = new THREE.Clock();
+let stateTime = 0; // 记录进入某状态的时长
+let prevPinch = false;
+initThree();
+initHands();
+initClickFallback(); // 降级点击事件
+animate();
+// ==========================================
+// 初始化 Three.js 引擎
+// ==========================================
+function initThree() {
+    scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x020205, 0.015);
+    camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.z = 25; 
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "high-performance" });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.getElementById('canvas-container').appendChild(renderer.domElement);
+    // 赛博朋克辉光管线
+    const renderScene = new RenderPass(scene, camera);
+    bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 2.2, 0.6, 0.15);
+    composer = new EffectComposer(renderer);
+    composer.addPass(renderScene);
+    composer.addPass(bloomPass);
+    generateMorphTargets();
+    // 内存数据分配
+    const geo = new THREE.BufferGeometry();
+    posArray = new Float32Array(P_COUNT * 3);
+    velArray = new Float32Array(P_COUNT * 3);
+    targetArray = new Float32Array(P_COUNT * 3);
+    colorArray = new Float32Array(P_COUNT * 3);
+    for (let i = 0; i < P_COUNT; i++) {
+        // 初始化于银河状态
+        const gp = galaxyPoints[i];
+        posArray[i*3] = gp.x + (Math.random()-0.5);
+        posArray[i*3+1] = gp.y + (Math.random()-0.5);
+        posArray[i*3+2] = gp.z + (Math.random()-0.5);
+        colorArray[i*3] = c_Silver.r; colorArray[i*3+1] = c_Silver.g; colorArray[i*3+2] = c_Silver.b;
+    }
+    geo.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(colorArray, 3));
+    const mat = new THREE.PointsMaterial({
+        size: 0.05, vertexColors: true, transparent: true, opacity: 0.85,
+        blending: THREE.AdditiveBlending, depthWrite: false
+    });
+    particles = new THREE.Points(geo, mat);
+    scene.add(particles);
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        composer.setSize(window.innerWidth, window.innerHeight);
+    });
+}
+// ==========================================
+// 形态数据预生成 (数学之美)
+// ==========================================
+function generateMorphTargets() {
+    // 1. 非线性银河 (中心极密，边缘极疏)
+    for(let i=0; i<P_COUNT; i++) {
+        const r = Math.pow(Math.random(), 3) * 55; // 3次方导致大量粒子聚集在极小值(中心)
+        const theta = Math.random() * Math.PI * 2;
+        const spiral = r * 0.25; 
+        const phi = (Math.random() - 0.5) * 2.5; 
+        galaxyPoints.push({
+            x: r * Math.cos(theta + spiral),
+            y: phi * (1 - r/55) * 6,
+            z: r * Math.sin(theta + spiral)
+        });
+    }
+    // 2. 悬浮礼物盒
+    for(let i=0; i<P_COUNT; i++) {
+        let x = (Math.random() - 0.5) * 6;
+        let y = (Math.random() - 0.5) * 6;
+        let z = (Math.random() - 0.5) * 6;
+        // 聚集在表面
+        if (Math.random() > 0.6) x = Math.sign(x) * 3;
+        else if (Math.random() > 0.5) y = Math.sign(y) * 3;
+        else z = Math.sign(z) * 3;
+        giftPoints.push({x, y: y - 2, z});
+    }
+    // 3. 高清离屏文字采样
+    const canvas = document.createElement('canvas');
+    canvas.width = 1200; canvas.height = 300;
+    const ctx = canvas.getContext('2d', {willReadFrequently: true});
+    ctx.fillStyle = 'white';
+    ctx.font = 'bold 220px "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('生日快乐', 600, 150);
+    const data = ctx.getImageData(0,0,1200,300).data;
+    let tempText = [];
+    for(let y=0; y<300; y+=3) {
+        for(let x=0; x<1200; x+=3) {
+            if(data[(y*1200+x)*4] > 128) {
+                tempText.push({ x: (x - 600)*0.03, y: (150 - y)*0.03 + 3, z: (Math.random()-0.5) });
+            }
+        }
+    }
+    for(let i=0; i<P_COUNT; i++) textPoints.push(tempText[i % tempText.length]);
+}
+// ==========================================
+// 物理演算引擎 (含垂柳烟花逻辑)
+// ==========================================
+function animate() {
+    requestAnimationFrame(animate);
+    const dt = clock.getDelta();
+    const time = clock.getElapsedTime();
+    stateTime += dt;
+    // 手势逻辑：状态自动推进
+    if (rightHand.active) {
+        if (currentState === STATES.GALAXY && rightHand.pinch && !prevPinch) {
+            triggerNextState(); // 银河 -> 礼物
+        } else if (currentState === STATES.GIFT && rightHand.open > 0.8) {
+            triggerNextState(); // 礼物 -> 文字 -> (自动延时)烟花
+        }
+    }
+    prevPinch = rightHand.pinch;
+    // 核心物理运算
+    for (let i = 0; i < P_COUNT; i++) {
+        let ix = i*3, iy = i*3+1, iz = i*3+2;
+        let px = posArray[ix], py = posArray[iy], pz = posArray[iz];
+        let vx = velArray[ix], vy = velArray[iy], vz = velArray[iz];
+        let tx = 0, ty = 0, tz = 0;
+        let targetColor = c_Silver;
+        if (currentState === STATES.GALAXY) {
+            // 银河：螺旋向心力 + 缓慢旋转
+            tx = galaxyPoints[i].x; ty = galaxyPoints[i].y; tz = galaxyPoints[i].z;
+            let angle = time * 0.15;
+            let rotX = tx * Math.cos(angle) - tz * Math.sin(angle);
+            let rotZ = tx * Math.sin(angle) + tz * Math.cos(angle);
+            vx += (rotX - px) * 0.015;
+            vy += (ty - py) * 0.015;
+            vz += (rotZ - pz) * 0.015;
+            targetColor = Math.hypot(px, pz) < 8 ? c_CoreWhite : c_Silver;
+        } else if (currentState === STATES.GIFT) {
+            // 礼物：吸附+捏合拖拽
+            tx = giftPoints[i].x; ty = giftPoints[i].y; tz = giftPoints[i].z;
+            if (rightHand.active && rightHand.pinch) {
+                tx += rightHand.pos.x; ty += rightHand.pos.y; tz += rightHand.pos.z;
+            }
+            vx += (tx - px) * 0.05;
+            vy += (ty - py) * 0.05;
+            vz += (tz - pz) * 0.05;
+            targetColor = c_Gold;
+        } else if (currentState === STATES.TEXT) {
+            // 文字：瞬间强烈吸附
+            tx = textPoints[i].x; ty = textPoints[i].y; tz = textPoints[i].z;
+            vx += (tx - px) * 0.1; // 极强引力
+            vy += (ty - py) * 0.1;
+            vz += (tz - pz) * 0.1;
+            targetColor = (i % 2 === 0) ? c_Pink : c_CoreWhite;
+        } else if (currentState === STATES.FIREWORK) {
+            // 烟花：重力下垂流淌感 (Gravity Waterfall)
+            // 不再追踪 tx, ty, tz，纯受力运算
+            let gravity = 0.015;
+            let horizontalFriction = 0.94; // 让水平扩散迅速停止
+            let verticalFriction = 0.99;   // 垂直下落越掉越快
+            vx *= horizontalFriction; 
+            vz *= horizontalFriction;
+            vy -= gravity; 
+            vy *= verticalFriction;
+            // 增加一点流体扰动，让瀑布更灵动
+            vx += Math.sin(time*3 + py)*0.01;
+            vz += Math.cos(time*3 + px)*0.01;
+            targetColor = (i % 3 === 0) ? c_Gold : c_Pink;
+        }
+        // 常规阻尼与坐标更新 (烟花状态在上面已处理阻尼，此处跳过)
+        if (currentState !== STATES.FIREWORK) {
+            vx *= 0.88; vy *= 0.88; vz *= 0.88;
+        }
+        posArray[ix] += vx; posArray[iy] += vy; posArray[iz] += vz;
+        velArray[ix] = vx; velArray[iy] = vy; velArray[iz] = vz;
+        // 色彩平滑插值
+        colorArray[ix] += (targetColor.r - colorArray[ix]) * 0.1;
+        colorArray[iy] += (targetColor.g - colorArray[iy]) * 0.1;
+        colorArray[iz] += (targetColor.b - colorArray[iz]) * 0.1;
+    }
+    particles.geometry.attributes.position.needsUpdate = true;
+    particles.geometry.attributes.color.needsUpdate = true;
+    // 摄像机/场景微动
+    if (currentState === STATES.TEXT) scene.rotation.y += 0.001;
+    composer.render();
+}
+// ==========================================
+// 状态推进器 (核心叙事控制)
+// ==========================================
+function triggerNextState() {
+    if (currentState === STATES.GALAXY) {
+        currentState = STATES.GIFT;
+        updateUI("🎁 捕获礼物盒", "🖐️ 猛然张开手掌：释放终极祝福");
+        bloomPass.strength = 1.8;
+    } 
+    else if (currentState === STATES.GIFT) {
+        currentState = STATES.TEXT;
+        updateUI("🎉 生日快乐！", "等待烟花绽放...");
+        document.getElementById('stage-text').classList.add('glowing');
+        bloomPass.strength = 2.5;
+        // 叙事大招：显示文字 1.2 秒后，自动触发瀑布烟花爆破
+        setTimeout(() => {
+            if (currentState === STATES.TEXT) {
+                currentState = STATES.FIREWORK;
+                updateUI("✨ 流光溢彩", "点击屏幕可重新开始");
+                triggerExplosion();
+            }
+        }, 1200);
+    }
+    else if (currentState === STATES.FIREWORK) {
+        // 重置回银河
+        currentState = STATES.GALAXY;
+        updateUI("✨ 浩瀚银河 缓缓流转", "🖐️ 右手捏合：捕获星光礼物");
+        document.getElementById('stage-text').classList.remove('glowing');
+    }
+}
+function updateUI(mainText, hintText) {
+    document.getElementById('stage-text').innerText = mainText;
+    document.getElementById('hint-text').innerText = hintText;
+}
+// 施加瞬间径向爆破力
+function triggerExplosion() {
+    for (let i = 0; i < P_COUNT; i++) {
+        let ix = i*3, iy = i*3+1, iz = i*3+2;
+        // 以画面偏上位置为爆破中心
+        let dx = posArray[ix] - 0; 
+        let dy = posArray[iy] - 5; 
+        let dz = posArray[iz] - 0;
+        let dist = Math.max(Math.hypot(dx, dy, dz), 0.5);
+        // 生成向外的强大动量
+        let force = (Math.random() * 20 + 5) / dist;
+        velArray[ix] += (dx/dist) * force;
+        velArray[iy] += (dy/dist) * force + (Math.random()*5); // 额外给一点向上的推力
+        velArray[iz] += (dz/dist) * force;
+    }
+}
+// 降级：点击屏幕推进
+function initClickFallback() {
+    window.addEventListener('pointerdown', () => { triggerNextState(); });
+}
+// ==========================================
+// MediaPipe 摄像头识别
+// ==========================================
+function initHands() {
+    const videoElement = document.getElementById('video-bg');
+    const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6, selfieMode: true });
+    hands.onResults(results => {
+        rightHand.active = false;
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            const lm = results.multiHandLandmarks[0];
+            rightHand.active = true;
+            // 坐标系映射
+            rightHand.pos.set((lm[9].x - 0.5) * 35, -(lm[9].y - 0.5) * 25, lm[9].z * -15);
+            // 开合度计算
+            const dist = Math.hypot(lm[8].x - lm[4].x, lm[8].y - lm[4].y);
+            rightHand.pinch = dist < 0.06;
+            rightHand.open = Math.min(Math.max((dist - 0.07) / 0.15, 0), 1);
+        }
+    });
+    const cameraInput = new Camera(videoElement, {
+        onFrame: async () => { await hands.send({ image: videoElement }); },
+        width: 1280, height: 720
+    });
+    cameraInput.start();
+}
+</script>
+</body>
+</html>
